@@ -11,7 +11,6 @@ from pathlib import Path
 # -------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
 WORKSPACE_ROOT = PROJECT_ROOT.parent if PROJECT_ROOT.name == "Model" else PROJECT_ROOT
-
 DATA_DIR = WORKSPACE_ROOT / "data"
 EMNIST_DIR = DATA_DIR / "emnist"
 SAMPLES_DIR = DATA_DIR / "samples"
@@ -44,6 +43,8 @@ BINARIZATION_METHOD = "sauvola"      # "sauvola" or "gaussian_adaptive"
 SAUVOLA_WINDOW_SIZE = 25             # Local window for Sauvola thresholding
 SAUVOLA_K = 0.2                      # Sauvola sensitivity parameter (0.1 - 0.5)
 SAUVOLA_R = 128                      # Sauvola dynamic range parameter
+DESPECKLE_METHOD = "median"          # "median", "morph_open", or None
+DESPECKLE_KERNEL_SIZE = 3            # Window size for despeckling noise suppression
 
 # -------------------------------------------------------------------------
 # Phase 3: Hierarchical Segmentation (Line -> Word -> Character)
@@ -51,9 +52,15 @@ SAUVOLA_R = 128                      # Sauvola dynamic range parameter
 HPP_SMOOTHING_SIGMA = 2.0            # 1D Gaussian smoothing for horizontal projection
 LINE_VALLEY_THRESHOLD_RATIO = 0.05   # Valley detection ratio relative to max HPP
 MIN_LINE_HEIGHT = 12                 # Minimum vertical height for a text line (pixels)
+MIN_LINE_GAP = 6                     # Gap below which consecutive lines are merged (pixels)
+WORD_DILATION_KERNEL_W = 15          # Width of horizontal dilation kernel for word bridging
 WORD_GAP_MULTIPLIER = 1.2            # Inter-word space threshold multiplier vs median char gap
 MIN_CHAR_AREA = 15                   # Minimum pixel area for valid character CC (noise filter)
+MIN_CHAR_WIDTH = 3                   # Minimum character bounding box width (pixels)
+MIN_CHAR_HEIGHT = 5                  # Minimum character bounding box height (pixels)
+MAX_CHAR_ASPECT_RATIO = 8.0          # Filter horizontal ruling lines or vertical scratches
 MAX_ASPECT_RATIO_SPLIT = 1.8         # Split wide connected components (joined characters)
+OVERLAP_SPLIT_THRESHOLD = 1.8        # Ratio against median width to trigger ligature split
 
 # -------------------------------------------------------------------------
 # Phase 4: Geometric Normalization
