@@ -10,8 +10,9 @@ This module handles:
 6. Manual corner coordinate fallback support.
 """
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import cv2
 import numpy as np
 
@@ -19,6 +20,43 @@ try:
     from . import config
 except ImportError:
     import config
+
+
+@dataclass
+class IngestionResult:
+    """Container holding Phase 1 ingestion artifacts with 3-tuple unpacking support."""
+    untouched_image: np.ndarray
+    flattened_image: np.ndarray
+    transform_meta: Dict[str, Any]
+
+    @property
+    def warp_applied(self) -> bool:
+        return bool(self.transform_meta.get("warp_applied", False))
+
+    @property
+    def homography_matrix(self) -> Optional[np.ndarray]:
+        return self.transform_meta.get("M", None)
+
+    @property
+    def inverse_homography(self) -> Optional[np.ndarray]:
+        M = self.homography_matrix
+        if M is not None:
+            try:
+                return np.linalg.inv(M)
+            except np.linalg.LinAlgError:
+                return None
+        return None
+
+    @property
+    def original_dimensions(self) -> Tuple[int, int]:
+        shape = self.untouched_image.shape
+        return (shape[0], shape[1])
+
+    def __iter__(self):
+        yield self.untouched_image
+        yield self.flattened_image
+        yield self.transform_meta
+
 
 
 def load_image(file_path: Union[str, Path]) -> Tuple[np.ndarray, np.ndarray]:
@@ -302,7 +340,7 @@ def ingest_image(
         ingested_image = raw_frame
 
     transform_meta["ingested_shape"] = ingested_image.shape
-    return original_image, ingested_image, transform_meta
+    return IngestionResult(original_image, ingested_image, transform_meta)
 
 
 class DocumentIngestionEngine:

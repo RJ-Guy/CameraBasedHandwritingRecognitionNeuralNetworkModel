@@ -66,14 +66,19 @@ OVERLAP_SPLIT_THRESHOLD = 1.8        # Ratio against median width to trigger lig
 # Phase 4: Geometric Normalization
 # -------------------------------------------------------------------------
 NORMALIZED_CHAR_SIZE = (16, 16)      # Standard input grid size (height, width)
+INNER_TARGET_SIZE = (14, 14)          # Active character size within canvas
 SLANT_CORRECTION_ENABLED = True      # Apply dual-centroid shear correction
 MAX_SLANT_ANGLE_DEG = 45.0           # Maximum plausible handwriting slant angle
+MIN_INK_PIXELS_FOR_SLANT = 5         # Minimum pixels in top/bottom zones for slant calculation
 
 # -------------------------------------------------------------------------
 # Phase 5: Circular DDD Handcrafted Feature Engine
 # -------------------------------------------------------------------------
 FEATURE_MODE = "circular_ddd"        # "circular_ddd" (256-D) or "flatten_16x16" (256-D)
-DDD_NUM_DIRECTIONS = 8               # Ray-casting directional count
+DDD_NUM_DIRECTIONS = 8               # Ray-casting directional count (8 compass directions)
+DDD_NUM_RINGS = 8                    # Concentric radial sampling rings (8 * 8 * 4 = 256)
+DDD_RAY_STEP_SIZE = 0.5              # Ray-casting integration step size (pixels)
+DDD_MAX_RAY_STEPS = 15               # Maximum sampling steps along each ray trajectory
 FEATURE_VECTOR_DIM = 256             # Strict input dimension for shallow MLP
 
 # -------------------------------------------------------------------------
@@ -85,6 +90,11 @@ MLP_BATCH_SIZE = 128                 # Mini-batch size
 MLP_LEARNING_RATE_INIT = 0.001       # Initial Adam learning rate
 MLP_RANDOM_STATE = 42                # Reproducibility seed
 EMNIST_SPLIT = "balanced"            # 47 classes (balanced digits + uppercase + lowercase)
+MODEL_FILE = MODELS_DIR / "emnist_mlp_model.joblib"
+SCALER_FILE = MODELS_DIR / "feature_scaler.joblib"
+LABEL_MAP_FILE = MODELS_DIR / "label_mapping.json"
+METRICS_FILE = MODELS_DIR / "training_metrics.json"
+CONFUSION_MATRIX_FILE = DEBUG_OUTPUT_DIR / "confusion_matrix.png"
 
 # -------------------------------------------------------------------------
 # Phase 7: Reconstruction & Visual Export
