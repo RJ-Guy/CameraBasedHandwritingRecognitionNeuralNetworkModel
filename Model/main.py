@@ -221,6 +221,72 @@ def run_pipeline(
     return result
 
 
+def run_batch_pipeline(
+    directory_path: Union[str, Path],
+    output_dir: Optional[Union[str, Path]] = None,
+    apply_warp: Optional[bool] = None,
+    feature_mode: str = config.FEATURE_MODE,
+    top_k_count: int = 3,
+    debug: bool = False,
+    quiet: bool = False,
+) -> List[PipelineResult]:
+    """
+    Executes the pipeline in batch mode across all supported images in a directory.
+
+    Args:
+        directory_path: Folder containing images (*.jpg, *.png, etc.).
+        output_dir: Root directory to save outputs.
+        apply_warp: Whether to apply perspective warp.
+        feature_mode: Feature mode ("circular_ddd" or "flatten_16x16").
+        top_k_count: Top-k ranking count.
+        debug: If True, saves intermediate debug images.
+        quiet: If True, suppresses individual reports.
+
+    Returns:
+        List of PipelineResult objects.
+    """
+    dir_p = Path(directory_path).resolve()
+    if not dir_p.exists() or not dir_p.is_dir():
+        raise NotADirectoryError(f"[Pipeline Error] Input path is not a valid directory: {dir_p}")
+
+    valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+    image_files = sorted([f for f in dir_p.iterdir() if f.is_file() and f.suffix.lower() in valid_exts])
+
+    if not image_files:
+        print(f"[Pipeline Warning] No supported image files found in '{dir_p}'")
+        return []
+
+    print(f"\n[Batch Processing] Found {len(image_files)} image(s) in {dir_p.name}/")
+    base_out_dir = Path(output_dir).resolve() if output_dir else config.OUTPUTS_DIR
+
+    results: List[PipelineResult] = []
+    for idx, img_f in enumerate(image_files, 1):
+        print(f"\n>>> [{idx}/{len(image_files)}] Processing: {img_f.name}")
+        res = run_pipeline(
+            input_path=img_f,
+            output_dir=base_out_dir,
+            apply_warp=apply_warp,
+            feature_mode=feature_mode,
+            top_k_count=top_k_count,
+            debug=debug,
+            quiet=quiet,
+        )
+        results.append(res)
+
+    print("\n" + "=" * 70)
+    print("BATCH PROCESSING COMPLETED SUMMARY")
+    print("=" * 70)
+    print(f"Total Images Processed   : {len(results)}")
+    total_chars = sum(r.reconstruction.total_characters for r in results)
+    mean_conf = float(np.mean([r.reconstruction.mean_confidence for r in results])) * 100 if results else 0.0
+    print(f"Total Characters Decoded : {total_chars}")
+    print(f"Average Model Confidence : {mean_conf:.1f}%")
+    print(f"Text Files Saved In      : {base_out_dir / 'text'}")
+    print(f"Annotated Images In      : {base_out_dir / 'annotated'}")
+    print("=" * 70 + "\n")
+    return results
+
+
 def print_execution_summary(result: PipelineResult) -> None:
     """Prints the structured CLI execution summary to stdout."""
     h, w = result.ingestion.original_dimensions
@@ -313,14 +379,25 @@ def main() -> int:
         apply_warp = True
 
     try:
-        run_pipeline(
-            input_path=args.input,
-            output_dir=args.output_dir,
-            apply_warp=apply_warp,
-            top_k_count=args.top_k,
-            debug=args.debug,
-            quiet=args.quiet,
-        )
+        input_target = Path(args.input).resolve()
+        if input_target.is_dir():
+            run_batch_pipeline(
+                directory_path=input_target,
+                output_dir=args.output_dir,
+                apply_warp=apply_warp,
+                top_k_count=args.top_k,
+                debug=args.debug,
+                quiet=args.quiet,
+            )
+        else:
+            run_pipeline(
+                input_path=input_target,
+                output_dir=args.output_dir,
+                apply_warp=apply_warp,
+                top_k_count=args.top_k,
+                debug=args.debug,
+                quiet=args.quiet,
+            )
         return 0
     except Exception as e:
         print(f"\n[FATAL PIPELINE ERROR] {e}", file=sys.stderr)

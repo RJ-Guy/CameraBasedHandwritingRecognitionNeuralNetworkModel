@@ -17,6 +17,7 @@ _model_main = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_model_main)
 
 run_pipeline = _model_main.run_pipeline
+run_batch_pipeline = _model_main.run_batch_pipeline
 PipelineResult = _model_main.PipelineResult
 main = _model_main.main
 
