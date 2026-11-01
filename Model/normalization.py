@@ -113,6 +113,14 @@ def estimate_slant_angle(
     if h < 4 or w < 2:
         return 0.0
 
+    active_y, active_x = np.where(char_binary > 0)
+    if len(active_x) > 0 and len(active_y) > 0:
+        ink_w = int(active_x.max() - active_x.min() + 1)
+        ink_h = int(active_y.max() - active_y.min() + 1)
+        # Broad glyphs (e.g. 'W', 'M', 'O', '8') naturally have asymmetrical centroids without cursive slant
+        if ink_w / max(1, ink_h) >= 0.95:
+            return 0.0
+
     mid_y = h // 2
     top_mask = (char_binary[:mid_y, :] > 0)
     bot_mask = (char_binary[mid_y:, :] > 0)
@@ -142,6 +150,10 @@ def estimate_slant_angle(
 
     angle_rad = math.atan2(dx, dy)
     angle_deg = math.degrees(angle_rad)
+
+    # Ignore subtle tilts (< 5.0 deg) to preserve upright glyph geometry
+    if abs(angle_deg) < 5.0:
+        return 0.0
 
     # Clamp to configured maximum slant angle
     return float(np.clip(angle_deg, -max_angle_deg, max_angle_deg))
@@ -179,8 +191,8 @@ def deskew_character(
     if char_image is None or char_image.size == 0:
         return np.zeros((1, 1), dtype=char_image.dtype if char_image is not None else np.uint8), char_image
 
-    if abs(slant_angle_deg) < 1.0:
-        # Negligible slant; return tightly cropped image
+    if abs(slant_angle_deg) < 5.0:
+        # Negligible slant; return tightly cropped image without shearing distortion
         return crop_to_ink(char_image), char_image.copy()
 
     h, w = char_image.shape[:2]
@@ -249,6 +261,7 @@ def resize_and_center_16x16(
     char_crop: np.ndarray,
     target_size: Tuple[int, int] = config.NORMALIZED_CHAR_SIZE,
     inner_size: Tuple[int, int] = config.INNER_TARGET_SIZE,
+    adaptive_stroke_dilation: bool = getattr(config, "ADAPTIVE_STROKE_DILATION_ENABLED", True),
 ) -> np.ndarray:
     """
     Resizes a character crop into a standardized 16x16 canvas while strictly
@@ -257,7 +270,8 @@ def resize_and_center_16x16(
     Args:
         char_crop: 2D uint8 or float32 character image.
         target_size: Canvas dimension (height, width), default (16, 16).
-        inner_size: Inner active area (height, width), default (14, 14).
+        inner_size: Inner active area (height, width), default (12, 12).
+        adaptive_stroke_dilation: Apply morphological dilation for high-res camera strokes.
 
     Returns:
         2D float32 array of shape (16, 16) with values normalized to [0.0, 1.0].
@@ -270,6 +284,14 @@ def resize_and_center_16x16(
     if h == 0 or w == 0:
         return canvas
 
+    # Adaptive stroke thickness matching for high-resolution camera captures
+    processed_crop = char_crop
+    if adaptive_stroke_dilation and h > 40:
+        dilate_r = max(0, int(round(h / 90.0)))
+        if dilate_r > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_r * 2 + 1, dilate_r * 2 + 1))
+            processed_crop = cv2.dilate(char_crop, k)
+
     inner_h, inner_w = inner_size
     target_h, target_w = target_size
 
@@ -280,7 +302,7 @@ def resize_and_center_16x16(
 
     # Choose anti-aliasing interpolation: INTER_AREA for downscale, INTER_LINEAR for upscale
     interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-    resized = cv2.resize(char_crop.astype(np.float32), (new_w, new_h), interpolation=interp)
+    resized = cv2.resize(processed_crop.astype(np.float32), (new_w, new_h), interpolation=interp)
 
     # Symmetrical centering offsets
     offset_x = (target_w - new_w) // 2
@@ -306,6 +328,7 @@ def normalize_character(
     target_size: Tuple[int, int] = config.NORMALIZED_CHAR_SIZE,
     inner_size: Tuple[int, int] = config.INNER_TARGET_SIZE,
     max_slant_angle_deg: float = config.MAX_SLANT_ANGLE_DEG,
+    adaptive_stroke_dilation: bool = getattr(config, "ADAPTIVE_STROKE_DILATION_ENABLED", True),
 ) -> NormalizedCharacter:
     """
     End-to-end normalization of a single character crop.
@@ -317,8 +340,9 @@ def normalize_character(
         char_id: Character index identifier.
         enable_slant_correction: Whether to apply dual-centroid slant deskewing.
         target_size: Standard output canvas dimensions (16, 16).
-        inner_size: Inner active area dimensions (14, 14).
+        inner_size: Inner active area dimensions (12, 12).
         max_slant_angle_deg: Maximum allowed slant correction angle.
+        adaptive_stroke_dilation: Whether to adaptively dilate high-res strokes.
 
     Returns:
         NormalizedCharacter object with 16x16 float32 normalized image.
@@ -345,8 +369,8 @@ def normalize_character(
     if enable_slant_correction:
         slant_deg = estimate_slant_angle(raw_crop, max_angle_deg=max_slant_angle_deg)
 
-    # 2. Affine horizontal shear deskewing
-    if enable_slant_correction and abs(slant_deg) >= 1.0:
+    # 2. Affine horizontal shear deskewing (only if slant is significant >= 5.0 deg)
+    if enable_slant_correction and abs(slant_deg) >= 5.0:
         deskewed_crop, _ = deskew_character(raw_crop, slant_angle_deg=slant_deg)
     else:
         deskewed_crop = crop_to_ink(raw_crop)
@@ -356,6 +380,7 @@ def normalize_character(
         deskewed_crop,
         target_size=target_size,
         inner_size=inner_size,
+        adaptive_stroke_dilation=adaptive_stroke_dilation,
     )
 
     return NormalizedCharacter(
@@ -374,6 +399,7 @@ def normalize_all_characters(
     enable_slant_correction: bool = config.SLANT_CORRECTION_ENABLED,
     target_size: Tuple[int, int] = config.NORMALIZED_CHAR_SIZE,
     inner_size: Tuple[int, int] = config.INNER_TARGET_SIZE,
+    adaptive_stroke_dilation: bool = getattr(config, "ADAPTIVE_STROKE_DILATION_ENABLED", True),
 ) -> NormalizationResult:
     """
     Normalizes a batch of character crops or a SegmentationResult hierarchy.
@@ -382,7 +408,8 @@ def normalize_all_characters(
         characters: List of CharacterCrop / 2D arrays, or a SegmentationResult instance.
         enable_slant_correction: Whether to apply dual-centroid slant deskewing.
         target_size: Output canvas dimensions (16, 16).
-        inner_size: Inner active area (14, 14).
+        inner_size: Inner active area (12, 12).
+        adaptive_stroke_dilation: Whether to adaptively dilate high-res strokes.
 
     Returns:
         NormalizationResult container with all normalized characters and summary statistics.
@@ -405,6 +432,7 @@ def normalize_all_characters(
             enable_slant_correction=enable_slant_correction,
             target_size=target_size,
             inner_size=inner_size,
+            adaptive_stroke_dilation=adaptive_stroke_dilation,
         )
         normalized_list.append(norm_char)
         total_slant += norm_char.slant_angle_deg
@@ -428,11 +456,13 @@ class NormalizationEngine:
         target_size: Tuple[int, int] = config.NORMALIZED_CHAR_SIZE,
         inner_size: Tuple[int, int] = config.INNER_TARGET_SIZE,
         max_slant_angle_deg: float = config.MAX_SLANT_ANGLE_DEG,
+        adaptive_stroke_dilation: bool = getattr(config, "ADAPTIVE_STROKE_DILATION_ENABLED", True),
     ):
         self.enable_slant_correction = enable_slant_correction
         self.target_size = target_size
         self.inner_size = inner_size
         self.max_slant_angle_deg = max_slant_angle_deg
+        self.adaptive_stroke_dilation = adaptive_stroke_dilation
 
     def normalize(self, char_input: Union[np.ndarray, Any], char_id: int = 0) -> NormalizedCharacter:
         """Normalizes a single character crop."""
@@ -443,6 +473,7 @@ class NormalizationEngine:
             target_size=self.target_size,
             inner_size=self.inner_size,
             max_slant_angle_deg=self.max_slant_angle_deg,
+            adaptive_stroke_dilation=self.adaptive_stroke_dilation,
         )
 
     def normalize_batch(self, characters: Union[List[Any], Any]) -> NormalizationResult:
@@ -452,4 +483,5 @@ class NormalizationEngine:
             enable_slant_correction=self.enable_slant_correction,
             target_size=self.target_size,
             inner_size=self.inner_size,
+            adaptive_stroke_dilation=self.adaptive_stroke_dilation,
         )

@@ -35,6 +35,8 @@ from reconstruction import (
     reconstruct_and_export,
     ReconstructionResult,
     ReconstructionEngine,
+    LexiconEngine,
+    get_default_lexicon_engine,
 )
 from visualization import (
     render_annotated_document,
@@ -206,6 +208,8 @@ class TestPhase7Reconstruction(unittest.TestCase):
         sample_path = config.SAMPLES_DIR / "IMG_20261021_212517.jpg"
         if not sample_path.exists():
             sample_path = config.SAMPLES_DIR / "sample_camera_capture_synth.png"
+        if not sample_path.exists():
+            sample_path = config.SAMPLES_DIR / "MachineLearning.jpg"
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             res = run_pipeline(
@@ -220,6 +224,37 @@ class TestPhase7Reconstruction(unittest.TestCase):
             self.assertGreater(res.reconstruction.total_characters, 0)
             self.assertGreater(res.reconstruction.mean_confidence, 0.0)
             self.assertGreater(res.runtime_seconds, 0.0)
+
+    def test_lexicon_engine_digit_substitution(self):
+        """Verify lexicon engine correctly resolves digit-to-letter confusion (e.g. FL0W -> FLOW)."""
+        engine = get_default_lexicon_engine()
+        # Mock char predictions for "FL0W"
+        mock_flow = [
+            PredictionResult(predicted_char="F", confidence=0.91, class_index=15, probabilities=np.zeros(47)),
+            PredictionResult(predicted_char="L", confidence=0.88, class_index=21, probabilities=np.zeros(47)),
+            PredictionResult(predicted_char="0", confidence=0.72, class_index=0, probabilities=np.zeros(47)),
+            PredictionResult(predicted_char="W", confidence=0.99, class_index=32, probabilities=np.zeros(47)),
+        ]
+        corrected, conf, raw = engine.correct_word(mock_flow)
+        self.assertEqual(corrected, "FLOW")
+        self.assertEqual(raw, "FL0W")
+        self.assertGreaterEqual(conf, 0.85)
+
+    def test_lexicon_engine_exact_match(self):
+        """Verify already correct dictionary words remain untouched."""
+        engine = get_default_lexicon_engine()
+        mock_net = [
+            PredictionResult(predicted_char="N", confidence=0.99, class_index=23, probabilities=np.zeros(47)),
+            PredictionResult(predicted_char="E", confidence=0.99, class_index=14, probabilities=np.zeros(47)),
+            PredictionResult(predicted_char="T", confidence=0.99, class_index=29, probabilities=np.zeros(47)),
+            PredictionResult(predicted_char="W", confidence=0.99, class_index=32, probabilities=np.zeros(47)),
+            PredictionResult(predicted_char="O", confidence=0.99, class_index=24, probabilities=np.zeros(47)),
+            PredictionResult(predicted_char="R", confidence=0.99, class_index=27, probabilities=np.zeros(47)),
+            PredictionResult(predicted_char="K", confidence=0.99, class_index=20, probabilities=np.zeros(47)),
+        ]
+        corrected, conf, raw = engine.correct_word(mock_net)
+        self.assertEqual(corrected, "NETWORK")
+        self.assertEqual(raw, "NETWORK")
 
 
 if __name__ == "__main__":

@@ -66,10 +66,11 @@ OVERLAP_SPLIT_THRESHOLD = 1.8        # Ratio against median width to trigger lig
 # Phase 4: Geometric Normalization
 # -------------------------------------------------------------------------
 NORMALIZED_CHAR_SIZE = (16, 16)      # Standard input grid size (height, width)
-INNER_TARGET_SIZE = (14, 14)          # Active character size within canvas
+INNER_TARGET_SIZE = (12, 12)          # Active character size within canvas (centered with 2px margin)
 SLANT_CORRECTION_ENABLED = True      # Apply dual-centroid shear correction
 MAX_SLANT_ANGLE_DEG = 45.0           # Maximum plausible handwriting slant angle
 MIN_INK_PIXELS_FOR_SLANT = 5         # Minimum pixels in top/bottom zones for slant calculation
+ADAPTIVE_STROKE_DILATION_ENABLED = True  # Morphological stroke dilation on high-res camera crops
 
 # -------------------------------------------------------------------------
 # Phase 5: Circular DDD Handcrafted Feature Engine
@@ -102,4 +103,7 @@ CONFUSION_MATRIX_FILE = DEBUG_OUTPUT_DIR / "confusion_matrix.png"
 OUTPUT_TEXT_ENCODING = "utf-8"
 DRAW_BOUNDING_BOXES = True
 DRAW_CONFIDENCE_SCORES = True
+ENABLE_LEXICON_CORRECTION = True     # Statistical beam-search dictionary post-correction
+LEXICON_FILE = MODELS_DIR / "lexicon.txt"
+LEXICON_MIN_AVG_PROB = 0.05          # Minimum average letter probability for candidate acceptance
 ANNOTATION_COLOR = (0, 255, 0)       # Green (BGR)

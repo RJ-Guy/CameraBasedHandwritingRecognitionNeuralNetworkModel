@@ -20,6 +20,7 @@ Theoretical & Algorithmic Foundations:
 """
 
 from dataclasses import dataclass, field
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
@@ -44,12 +45,14 @@ class ReconstructedWord:
     bbox: Optional[Tuple[int, int, int, int]] = None
     character_count: int = 0
     characters: List[Any] = field(default_factory=list)
+    raw_text: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "word_id": self.word_id,
             "line_id": self.line_id,
             "text": self.text,
+            "raw_text": self.raw_text,
             "confidence": round(float(self.confidence), 4),
             "bbox": list(self.bbox) if self.bbox is not None else None,
             "character_count": self.character_count,
@@ -107,6 +110,127 @@ class ReconstructionResult:
 
 
 # -------------------------------------------------------------------------
+# Lexicon Post-Correction Engine
+# -------------------------------------------------------------------------
+
+_CACHED_LEXICON_ENGINE = None
+
+
+class LexiconEngine:
+    """
+    Loads and manages vocabulary and vectorized probability scoring for OCR post-correction.
+    """
+
+    def __init__(self, lexicon_path: Optional[Union[str, Path]] = None):
+        self.lexicon_path = Path(lexicon_path or getattr(config, "LEXICON_FILE", config.MODELS_DIR / "lexicon.txt"))
+        self.clean_lexicon: set = set()
+        self.lexicon_by_len: Dict[int, List[str]] = {}
+        self.lexicon_arrays: Dict[int, Tuple[List[str], np.ndarray]] = {}
+        self.char_to_classes: Dict[str, List[int]] = {}
+        self._load_lexicon()
+        self._load_label_mapping()
+
+    def _load_lexicon(self):
+        if not self.lexicon_path.exists():
+            sys_dict = Path("/usr/share/dict/words")
+            if sys_dict.exists():
+                self.lexicon_path = sys_dict
+
+        if self.lexicon_path.exists():
+            with open(self.lexicon_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    w = line.strip().lower()
+                    if w and all("a" <= c <= "z" for c in w):
+                        self.clean_lexicon.add(w)
+                        self.lexicon_by_len.setdefault(len(w), []).append(w)
+
+            for L, words in self.lexicon_by_len.items():
+                arr = np.array([[ord(c) - ord("a") for c in w] for w in words], dtype=np.int32)
+                self.lexicon_arrays[L] = (words, arr)
+
+    def _load_label_mapping(self):
+        map_file = getattr(config, "LABEL_MAP_FILE", config.MODELS_DIR / "label_mapping.json")
+        if Path(map_file).exists():
+            with open(map_file, "r", encoding="utf-8") as f:
+                mapping = json.load(f)
+            for idx_str, ch in mapping.items():
+                self.char_to_classes.setdefault(ch.lower(), []).append(int(idx_str))
+
+    def correct_word(
+        self,
+        char_preds: List[Any],
+        min_avg_prob: float = getattr(config, "LEXICON_MIN_AVG_PROB", 0.05),
+    ) -> Tuple[str, float, str]:
+        """
+        Corrects an ordered list of character predictions using probability-weighted lexicon scoring.
+
+        Returns:
+            Tuple of (corrected_text, confidence, raw_text).
+        """
+        L = len(char_preds)
+        raw_word = "".join(getattr(p, "predicted_char", "") for p in char_preds)
+        raw_conf = float(np.mean([getattr(p, "confidence", 1.0) for p in char_preds])) if char_preds else 0.0
+
+        alpha_chars = [c for c in raw_word if c.isalpha()]
+        if not alpha_chars or not self.clean_lexicon:
+            return raw_word, raw_conf, raw_word
+
+        upper_ratio = sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars)
+        is_upper = (upper_ratio >= 0.60)
+        is_title = (not is_upper) and raw_word[0].isupper()
+
+        low_word = raw_word.lower()
+        if low_word in self.clean_lexicon:
+            formatted = raw_word.upper() if is_upper else (raw_word.capitalize() if is_title else raw_word)
+            return formatted, raw_conf, raw_word
+
+        # Fast digit-letter substitution (0 -> o, 1 -> i, etc.)
+        sub_map = {"0": "o", "1": "i", "5": "s", "8": "b", "2": "z"}
+        digit_fixed = "".join(sub_map.get(c, c) for c in low_word)
+        if digit_fixed in self.clean_lexicon:
+            formatted = digit_fixed.upper() if is_upper else (digit_fixed.capitalize() if is_title else digit_fixed)
+            return formatted, max(raw_conf, 0.85), raw_word
+
+        # Vectorized beam search over same-length candidate words
+        if L in self.lexicon_arrays:
+            cands, cand_indices = self.lexicon_arrays[L]
+            logp_matrix = np.full((L, 26), -15.0, dtype=np.float32)
+            for i, p in enumerate(char_preds):
+                probs = getattr(p, "probabilities", None)
+                if probs is not None:
+                    for c_idx in range(26):
+                        char_letter = chr(ord("a") + c_idx)
+                        classes = self.char_to_classes.get(char_letter, [])
+                        prob = sum(probs[c] for c in classes) if classes else 1e-6
+                        logp_matrix[i, c_idx] = np.log(max(prob, 1e-6))
+                else:
+                    p_char = getattr(p, "predicted_char", "").lower()
+                    if "a" <= p_char <= "z":
+                        conf = getattr(p, "confidence", 0.5)
+                        logp_matrix[i, ord(p_char) - ord("a")] = np.log(max(conf, 0.5))
+
+            word_scores = np.sum(logp_matrix[np.arange(L), cand_indices], axis=1)
+            best_idx = int(np.argmax(word_scores))
+            best_word = cands[best_idx]
+            best_score = float(word_scores[best_idx])
+            avg_prob = float(np.exp(best_score / L))
+
+            if avg_prob >= min_avg_prob:
+                formatted = best_word.upper() if is_upper else (best_word.capitalize() if is_title else best_word)
+                return formatted, avg_prob, raw_word
+
+        return raw_word, raw_conf, raw_word
+
+
+def get_default_lexicon_engine() -> LexiconEngine:
+    """Singleton accessor for default LexiconEngine."""
+    global _CACHED_LEXICON_ENGINE
+    if _CACHED_LEXICON_ENGINE is None:
+        _CACHED_LEXICON_ENGINE = LexiconEngine()
+    return _CACHED_LEXICON_ENGINE
+
+
+# -------------------------------------------------------------------------
 # Core Reconstruction Engine
 # -------------------------------------------------------------------------
 
@@ -126,6 +250,7 @@ def reconstruct_text(
     predictions: List[Any],
     segmentation_result: Optional[Any] = None,
     paragraph_gap_factor: float = 1.8,
+    enable_lexicon: bool = getattr(config, "ENABLE_LEXICON_CORRECTION", True),
 ) -> ReconstructionResult:
     """
     Reconstructs recognized character predictions into structured text lines and words.
@@ -136,11 +261,13 @@ def reconstruct_text(
       - Characters ordered left-to-right within words.
     Detects paragraph spacing when vertical gap between lines exceeds
     paragraph_gap_factor * median_line_height.
+    Applies probability-weighted lexicon post-correction when enabled.
 
     Args:
         predictions: List of PredictionResult objects from Phase 6.
         segmentation_result: Optional SegmentationResult from Phase 3 for line/word geometry.
         paragraph_gap_factor: Multiplier for paragraph gap detection.
+        enable_lexicon: Whether to apply lexicon dictionary post-correction.
 
     Returns:
         ReconstructionResult dataclass instance.
@@ -217,9 +344,16 @@ def reconstruct_text(
                 key=lambda p: p.bbox[0] if getattr(p, "bbox", None) is not None else getattr(p, "char_id", 0)
             )
 
-            word_text = "".join(getattr(p, "predicted_char", "") for p in char_preds_sorted)
+            raw_word_text = "".join(getattr(p, "predicted_char", "") for p in char_preds_sorted)
             word_confs = [getattr(p, "confidence", 1.0) for p in char_preds_sorted]
             word_conf = float(np.mean(word_confs)) if word_confs else 0.0
+
+            # Lexicon post-correction using candidate beam search
+            if enable_lexicon and len(char_preds_sorted) > 0:
+                lex_engine = get_default_lexicon_engine()
+                word_text, word_conf, _ = lex_engine.correct_word(char_preds_sorted)
+            else:
+                word_text = raw_word_text
 
             char_bboxes = [getattr(p, "bbox", None) for p in char_preds_sorted]
             word_bbox = compute_enclosing_bbox(char_bboxes)
@@ -232,6 +366,7 @@ def reconstruct_text(
                 bbox=word_bbox,
                 character_count=len(char_preds_sorted),
                 characters=char_preds_sorted,
+                raw_text=raw_word_text,
             )
             reconstructed_words.append(rec_word)
 
@@ -336,6 +471,7 @@ def reconstruct_and_export(
     segmentation_result: Optional[Any] = None,
     image_name: Optional[str] = None,
     paragraph_gap_factor: float = 1.8,
+    enable_lexicon: bool = getattr(config, "ENABLE_LEXICON_CORRECTION", True),
 ) -> ReconstructionResult:
     """
     High-level entry point: Reconstructs text and exports directly to file.
@@ -346,6 +482,7 @@ def reconstruct_and_export(
         segmentation_result: Optional SegmentationResult from Phase 3.
         image_name: Optional base name of source photograph.
         paragraph_gap_factor: Multiplier for paragraph gap detection.
+        enable_lexicon: Whether to apply lexicon dictionary post-correction.
 
     Returns:
         ReconstructionResult with output_file_path populated.
@@ -354,6 +491,7 @@ def reconstruct_and_export(
         predictions=predictions,
         segmentation_result=segmentation_result,
         paragraph_gap_factor=paragraph_gap_factor,
+        enable_lexicon=enable_lexicon,
     )
 
     if output_path is None:
@@ -376,9 +514,11 @@ class ReconstructionEngine:
         self,
         paragraph_gap_factor: float = 1.8,
         encoding: str = config.OUTPUT_TEXT_ENCODING,
+        enable_lexicon: bool = getattr(config, "ENABLE_LEXICON_CORRECTION", True),
     ):
         self.paragraph_gap_factor = paragraph_gap_factor
         self.encoding = encoding
+        self.enable_lexicon = enable_lexicon
 
     def reconstruct(
         self,
@@ -390,6 +530,7 @@ class ReconstructionEngine:
             predictions=predictions,
             segmentation_result=segmentation_result,
             paragraph_gap_factor=self.paragraph_gap_factor,
+            enable_lexicon=self.enable_lexicon,
         )
 
     def export(

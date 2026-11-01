@@ -199,8 +199,8 @@ def predict_single_vector(
     else:
         x_2d = feature_vector
 
-    # 1. Standardize features using training scaler
-    x_scaled = scaler.transform(x_2d)
+    # 1. Standardize features using training scaler (with 5-sigma outlier clamp to prevent saturation)
+    x_scaled = np.clip(scaler.transform(x_2d), -5.0, 5.0)
 
     # 2. Forward Propagation -> Softmax class probability distribution
     if use_numpy_forward and hasattr(model, "coefs_"):
@@ -322,8 +322,8 @@ def predict_batch(
     if X.shape[0] == 0:
         return []
 
-    # Batch standardization & Softmax probability forward pass
-    X_scaled = scl.transform(X)
+    # Batch standardization & Softmax probability forward pass (with 5-sigma outlier clamp)
+    X_scaled = np.clip(scl.transform(X), -5.0, 5.0)
     probs_matrix = clf.predict_proba(X_scaled)
 
     results: List[PredictionResult] = []

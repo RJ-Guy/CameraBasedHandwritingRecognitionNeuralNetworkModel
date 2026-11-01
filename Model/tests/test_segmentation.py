@@ -14,6 +14,7 @@ Verifies:
 """
 
 import sys
+from typing import List, Tuple
 import unittest
 from pathlib import Path
 import cv2

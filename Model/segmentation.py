@@ -297,18 +297,23 @@ def detect_words(
     off_x, off_y = line_offset
     line_h, line_w = line_binary.shape[:2]
 
-    # Adaptive horizontal dilation kernel width based on line height
-    k_w = max(5, int(min(word_dilation_w, max(7, line_h * 0.35))))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, 1))
+    # Adaptive horizontal and vertical dilation kernel based on line height
+    k_w = max(5, int(line_h * 0.30))
+    k_h = max(1, int(line_h * 0.15))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, k_h))
     dilated = cv2.dilate(line_binary, kernel, iterations=1)
 
     # Connected components of dilated line slice
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
 
     word_boxes: List[Tuple[int, int, int, int]] = []
+    adaptive_min_word_area = max(min_word_area, int(line_h * 5))
+    adaptive_min_w = max(6, int(line_h * 0.10))
+    adaptive_min_h = max(6, int(line_h * 0.10))
+
     for label in range(1, num_labels):
         x, y, w, h, area = stats[label]
-        if area < min_word_area or w < 6:
+        if area < adaptive_min_word_area or w < adaptive_min_w:
             continue
 
         # Refine word boundaries to active ink pixels in original un-dilated line
@@ -323,7 +328,7 @@ def detect_words(
         real_h = int(active_y.max() - active_y.min() + 1)
 
         # Ignore tiny border touches
-        if real_w < 6 or real_h < 6:
+        if real_w < adaptive_min_w or real_h < adaptive_min_h:
             continue
 
         # Convert to global coordinates
@@ -340,54 +345,73 @@ def detect_words(
 
 def merge_diacritics(
     boxes: List[Tuple[int, int, int, int]],
-    max_vertical_gap: int = 15,
+    max_vertical_gap: Optional[int] = 15,
+    word_h: Optional[int] = None,
 ) -> List[Tuple[int, int, int, int]]:
     """
-    Merges dots on 'i' and 'j' or accents located directly above character stems.
+    Merges dots on 'i' and 'j', accents, and intersecting strokes of the same character.
 
     Args:
         boxes: List of candidate character bounding boxes (x, y, w, h).
         max_vertical_gap: Maximum vertical distance between diacritic and main stem.
+        word_h: Optional word height for resolution-adaptive merging.
 
     Returns:
-        Consolidated list of bounding boxes with diacritics unified into stems.
+        Consolidated list of bounding boxes with diacritics and sub-strokes unified.
     """
     if len(boxes) <= 1:
         return boxes
 
-    # Sort by y ascending (highest items first)
-    sorted_boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
-    merged = []
-    used = set()
+    if word_h is None:
+        word_h = max(b[3] for b in boxes)
 
-    for i in range(len(sorted_boxes)):
-        if i in used:
-            continue
-        bx, by, bw, bh = sorted_boxes[i]
-        merged_box = [bx, by, bw, bh]
+    effective_vert_gap = max(max_vertical_gap or 15, int(word_h * 0.40))
 
-        for j in range(i + 1, len(sorted_boxes)):
-            if j in used:
+    changed = True
+    current = list(boxes)
+    while changed:
+        changed = False
+        new_boxes = []
+        used = set()
+        for i in range(len(current)):
+            if i in used:
                 continue
-            jx, jy, jw, jh = sorted_boxes[j]
+            x1, y1, w1, h1 = current[i]
+            merged_box = [x1, y1, w1, h1]
 
-            # Check if one box is directly above the other with horizontal overlap
-            horiz_overlap = not (bx + bw < jx or jx + jw < bx)
-            vert_gap = jy - (by + bh)
+            for j in range(i + 1, len(current)):
+                if j in used:
+                    continue
+                x2, y2, w2, h2 = current[j]
 
-            if horiz_overlap and 0 <= vert_gap <= max_vertical_gap:
-                # Merge boxes
-                new_x = min(bx, jx)
-                new_y = min(by, jy)
-                new_w = max(bx + bw, jx + jw) - new_x
-                new_h = max(by + bh, jy + jh) - new_y
-                merged_box = [new_x, new_y, new_w, new_h]
-                used.add(j)
-                break
+                overlap_x = min(merged_box[0] + merged_box[2], x2 + w2) - max(merged_box[0], x2)
+                overlap_y = min(merged_box[1] + merged_box[3], y2 + h2) - max(merged_box[1], y2)
+                vert_gap = max(0, max(merged_box[1], y2) - min(merged_box[1] + merged_box[3], y2 + h2))
+                min_w = min(merged_box[2], w2)
 
-        merged.append(tuple(merged_box))
+                combined_w = max(merged_box[0] + merged_box[2], x2 + w2) - min(merged_box[0], x2)
+                combined_h = max(merged_box[1] + merged_box[3], y2 + h2) - min(merged_box[1], y2)
 
-    return merged
+                should_merge = False
+                # 1. 2D intersection or significant horizontal overlap
+                if overlap_x >= max(4, int(min_w * 0.15)):
+                    if overlap_y > 0 or vert_gap <= effective_vert_gap:
+                        should_merge = True
+
+                # Bound combined width to reasonable character aspect ratio
+                if should_merge and combined_w <= int(max(word_h, 30) * 1.15):
+                    new_x = min(merged_box[0], x2)
+                    new_y = min(merged_box[1], y2)
+                    merged_box = [new_x, new_y, combined_w, combined_h]
+                    used.add(j)
+                    changed = True
+
+            used.add(i)
+            new_boxes.append(tuple(merged_box))
+        current = new_boxes
+
+    current.sort(key=lambda b: b[0])
+    return current
 
 
 def split_wide_ligature(
@@ -474,16 +498,20 @@ def extract_characters(
     off_x, off_y = word_offset
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(word_binary, connectivity=8)
 
+    word_h, word_w = word_binary.shape[:2]
+    adaptive_min_area = max(min_area, int(word_h * 0.03 * word_h * 0.03))
+    adaptive_min_h = max(min_h, int(word_h * 0.10))
+
     raw_candidate_boxes: List[Tuple[int, int, int, int]] = []
     for label in range(1, num_labels):
         x, y, w, h, area = stats[label]
 
         # 1. Reject tiny dust speckles
-        if area < min_area:
+        if area < adaptive_min_area:
             continue
 
         # 2. Reject dimensions below minimum character threshold
-        if w < min_w or h < min_h:
+        if w < min_w or h < adaptive_min_h:
             continue
 
         # 3. Reject extreme aspect ratios (scratches or horizontal ruling lines)
@@ -496,8 +524,8 @@ def extract_characters(
     if not raw_candidate_boxes:
         return []
 
-    # 4. Merge diacritics (dots on 'i', accents)
-    boxes = merge_diacritics(raw_candidate_boxes, max_vertical_gap=15)
+    # 4. Merge diacritics (dots on 'i', accents, stroke fragments)
+    boxes = merge_diacritics(raw_candidate_boxes, word_h=word_h)
 
     # 5. Ligature splitting and final crop generation
     final_crops: List[CharacterCrop] = []

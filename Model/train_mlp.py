@@ -25,7 +25,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 import cv2
 import joblib
 import matplotlib
@@ -173,6 +173,75 @@ def generate_handwriting_dataset(
     return X, y
 
 
+def load_real_emnist_dataset(
+    npz_path: Optional[Union[str, Path]] = None,
+    cache_path: Optional[Union[str, Path]] = None,
+    feature_mode: str = config.FEATURE_MODE,
+    max_samples: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Loads genuine EMNIST Balanced handwriting dataset and extracts standardized features.
+    Caches extracted features to disk (data/emnist/emnist_features_{feature_mode}.npz) for fast re-use.
+    """
+    if npz_path is None:
+        npz_path = config.EMNIST_DIR / "emnist_balanced.npz"
+    npz_path = Path(npz_path)
+
+    if cache_path is None:
+        cache_path = config.EMNIST_DIR / f"emnist_features_{feature_mode}.npz"
+    cache_path = Path(cache_path)
+
+    if not npz_path.exists():
+        raise FileNotFoundError(f"[EMNIST Loader] Dataset archive not found at: {npz_path}")
+
+    # Check for feature cache first
+    if cache_path.exists() and max_samples is None:
+        print(f"[Dataset Loader] Found precomputed feature cache at: {cache_path}")
+        cache_data = np.load(cache_path)
+        X = cache_data["X"]
+        y = cache_data["y"]
+        print(f"[Dataset Loader] Loaded {X.shape[0]:,} precomputed feature vectors from cache.")
+        return X, y
+
+    print(f"[Dataset Loader] Loading raw EMNIST Balanced dataset from: {npz_path}...")
+    raw_data = np.load(npz_path)
+    X_raw = raw_data["X"]
+    y_raw = raw_data["y"]
+
+    if max_samples is not None and max_samples < len(X_raw):
+        from sklearn.model_selection import StratifiedShuffleSplit
+        sss = StratifiedShuffleSplit(n_splits=1, train_size=max_samples, random_state=42)
+        idx, _ = next(sss.split(X_raw, y_raw))
+        X_raw = X_raw[idx]
+        y_raw = y_raw[idx]
+        print(f"[Dataset Loader] Subsampled to {len(X_raw):,} samples.")
+
+    total_samples = len(X_raw)
+    print(f"[Dataset Loader] Extracting '{feature_mode}' features for {total_samples:,} samples using parallel CPU cores...")
+    t0 = time.time()
+
+    def _extract_single(row):
+        # Transpose NIST image so it is upright
+        img = row.reshape(28, 28).T
+        crop = resize_and_center_16x16(img)
+        return extract_features(crop, mode=feature_mode)
+
+    from joblib import Parallel, delayed
+    results = Parallel(n_jobs=-1, batch_size=128)(delayed(_extract_single)(row) for row in X_raw)
+    X = np.array(results, dtype=np.float32)
+    y = y_raw.astype(np.int32)
+    elapsed = time.time() - t0
+    print(f"[Dataset Loader] Extracted {X.shape[0]:,} feature vectors in {elapsed:.2f}s ({X.shape[0]/max(0.01, elapsed):.1f} samples/sec).")
+
+    # Cache if full dataset
+    if max_samples is None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cache_path, X=X, y=y)
+        print(f"[Dataset Loader] Saved feature cache to: {cache_path} ({cache_path.stat().st_size / (1024*1024):.2f} MB)")
+
+    return X, y
+
+
 # -------------------------------------------------------------------------
 # Training Pipeline
 # -------------------------------------------------------------------------
@@ -185,6 +254,8 @@ def train_mlp_classifier(
     samples_per_class: int = 100,
     feature_mode: str = config.FEATURE_MODE,
     random_state: int = config.MLP_RANDOM_STATE,
+    use_real_emnist: bool = True,
+    max_samples: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Trains the shallow MLP classifier (256 -> 100 -> 90 -> N classes), evaluates performance,
@@ -208,15 +279,25 @@ def train_mlp_classifier(
     print(f"Mini-Batch Size     : {batch_size}")
     print("=" * 65)
 
-    # 1. Acquire Dataset (Offline synthetic generator with augmented handwriting styles)
+    # 1. Acquire Dataset
     t0 = time.time()
-    X, y = generate_handwriting_dataset(
-        classes=classes,
-        samples_per_class=samples_per_class,
-        feature_mode=feature_mode,
-    )
+    real_npz = config.EMNIST_DIR / "emnist_balanced.npz"
+    if use_real_emnist and real_npz.exists() and dataset_name.lower() == "emnist":
+        print(f"[Dataset] Loading real human handwriting from EMNIST Balanced archive ({real_npz})...")
+        X, y = load_real_emnist_dataset(
+            npz_path=real_npz,
+            feature_mode=feature_mode,
+            max_samples=max_samples,
+        )
+    else:
+        print(f"[Dataset] Using synthetic offline generator ({samples_per_class} samples/class)...")
+        X, y = generate_handwriting_dataset(
+            classes=classes,
+            samples_per_class=samples_per_class,
+            feature_mode=feature_mode,
+        )
     data_gen_time = time.time() - t0
-    print(f"[Dataset] Generated {X.shape[0]:,} samples in {data_gen_time:.2f}s. Feature matrix shape: {X.shape}")
+    print(f"[Dataset] Ready with {X.shape[0]:,} samples in {data_gen_time:.2f}s. Feature matrix shape: {X.shape}")
 
     # 2. Stratified Train / Test Split (80% Train, 20% Test)
     X_train, X_test, y_train, y_test = train_test_split(
@@ -322,8 +403,10 @@ def main():
     parser.add_argument("--split", type=str, default="balanced", help="EMNIST split name")
     parser.add_argument("--epochs", type=int, default=50, help="Maximum training epochs")
     parser.add_argument("--batch-size", type=int, default=128, help="Mini-batch size")
-    parser.add_argument("--samples-per-class", type=int, default=80, help="Augmented samples per class")
+    parser.add_argument("--samples-per-class", type=int, default=80, help="Augmented samples per class (synthetic mode)")
     parser.add_argument("--mode", type=str, default=config.FEATURE_MODE, help="Feature extraction mode")
+    parser.add_argument("--synthetic", action="store_true", help="Force synthetic generator instead of real EMNIST")
+    parser.add_argument("--max-samples", type=int, default=None, help="Limit number of training samples for quick testing")
 
     args = parser.parse_args()
     train_mlp_classifier(
@@ -333,6 +416,8 @@ def main():
         batch_size=args.batch_size,
         samples_per_class=args.samples_per_class,
         feature_mode=args.mode,
+        use_real_emnist=not args.synthetic,
+        max_samples=args.max_samples,
     )
 
 
