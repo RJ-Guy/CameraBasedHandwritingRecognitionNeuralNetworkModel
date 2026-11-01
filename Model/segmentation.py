@@ -279,8 +279,8 @@ def detect_words(
     min_word_area: int = 25,
 ) -> List[Tuple[int, int, int, int]]:
     """
-    Detects word regions within a line slice by horizontally dilating to bridge
-    character gaps while preserving larger inter-word spaces.
+    Detects word regions within a line slice using adaptive bimodal gap clustering
+    between character components, with dilation fallback.
 
     Args:
         line_binary: 2D binary mask of the line.
@@ -297,44 +297,104 @@ def detect_words(
     off_x, off_y = line_offset
     line_h, line_w = line_binary.shape[:2]
 
-    # Adaptive horizontal and vertical dilation kernel based on line height
-    k_w = max(5, int(line_h * 0.30))
-    k_h = max(1, int(line_h * 0.15))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, k_h))
-    dilated = cv2.dilate(line_binary, kernel, iterations=1)
-
-    # Connected components of dilated line slice
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
-
-    word_boxes: List[Tuple[int, int, int, int]] = []
-    adaptive_min_word_area = max(min_word_area, int(line_h * 5))
-    adaptive_min_w = max(6, int(line_h * 0.10))
+    # Find connected components within the text line
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(line_binary, connectivity=8)
+    valid_comps = []
+    adaptive_min_area = max(15, int(line_h * 0.08 * line_h * 0.08))
     adaptive_min_h = max(6, int(line_h * 0.10))
 
-    for label in range(1, num_labels):
-        x, y, w, h, area = stats[label]
-        if area < adaptive_min_word_area or w < adaptive_min_w:
+    for i in range(1, num_labels):
+        x, y, w, h, area = stats[i]
+        if area >= adaptive_min_area and w >= 3 and h >= adaptive_min_h:
+            valid_comps.append([x, y, w, h])
+
+    if not valid_comps:
+        return []
+
+    valid_comps.sort(key=lambda b: b[0])
+
+    # Cluster components that horizontally overlap or are adjacent stroke fragments
+    merged = []
+    for b in valid_comps:
+        if not merged:
+            merged.append(list(b))
+        else:
+            prev = merged[-1]
+            if b[0] <= prev[0] + prev[2] + 2:
+                new_x = min(prev[0], b[0])
+                new_y = min(prev[1], b[1])
+                new_r = max(prev[0] + prev[2], b[0] + b[2])
+                new_b = max(prev[1] + prev[3], b[1] + b[3])
+                merged[-1] = [new_x, new_y, new_r - new_x, new_b - new_y]
+            else:
+                merged.append(list(b))
+
+    if len(merged) <= 1:
+        ay, ax = np.where(line_binary == 255)
+        if len(ax) == 0:
+            return []
+        rx, ry = int(ax.min()), int(ay.min())
+        rw = int(ax.max() - ax.min() + 1)
+        rh = int(ay.max() - ay.min() + 1)
+        return [(off_x + rx, off_y + ry, rw, rh)]
+
+    # Compute horizontal gaps between consecutive character clusters
+    gaps = [max(0, merged[i + 1][0] - (merged[i][0] + merged[i][2])) for i in range(len(merged) - 1)]
+    gaps_arr = np.array(sorted(gaps), dtype=np.float32)
+
+    if len(np.unique(gaps_arr)) < 2:
+        threshold = float(gaps_arr[0] - 1) if gaps_arr[0] >= max(6, int(line_h * 0.20)) else float(line_h * 0.35)
+    else:
+        # 1D Otsu thresholding to separate intra-word gaps from inter-word gaps
+        best_thresh = gaps_arr[-1]
+        best_var = -1.0
+        for t in np.unique(gaps_arr)[:-1]:
+            w0 = np.mean(gaps_arr <= t)
+            w1 = np.mean(gaps_arr > t)
+            if w0 == 0 or w1 == 0:
+                continue
+            m0 = np.mean(gaps_arr[gaps_arr <= t])
+            m1 = np.mean(gaps_arr[gaps_arr > t])
+            v = w0 * w1 * ((m0 - m1) ** 2)
+            if v > best_var:
+                best_var = v
+                best_thresh = t
+
+        m0 = np.mean(gaps_arr[gaps_arr <= best_thresh])
+        m1 = np.mean(gaps_arr[gaps_arr > best_thresh])
+
+        if m1 >= 1.6 * max(1.0, m0) and (m1 - m0) >= max(5.0, line_h * 0.10):
+            t_low = gaps_arr[gaps_arr <= best_thresh][-1]
+            t_high = gaps_arr[gaps_arr > best_thresh][0]
+            threshold = float((t_low + t_high) / 2.0)
+        else:
+            threshold = float(line_h * 0.35)
+
+    # Group character clusters into words
+    word_groups = [[merged[0]]]
+    for i in range(len(merged) - 1):
+        g = merged[i + 1][0] - (merged[i][0] + merged[i][2])
+        if g > threshold:
+            word_groups.append([merged[i + 1]])
+        else:
+            word_groups[-1].append(merged[i + 1])
+
+    word_boxes: List[Tuple[int, int, int, int]] = []
+    for grp in word_groups:
+        gx1 = min(b[0] for b in grp)
+        gy1 = min(b[1] for b in grp)
+        gx2 = max(b[0] + b[2] for b in grp)
+        gy2 = max(b[1] + b[3] for b in grp)
+        crop = line_binary[gy1:gy2, gx1:gx2]
+        ay, ax = np.where(crop == 255)
+        if len(ax) == 0:
             continue
+        rx = gx1 + int(ax.min())
+        ry = gy1 + int(ay.min())
+        rw = int(ax.max() - ax.min() + 1)
+        rh = int(ay.max() - ay.min() + 1)
+        word_boxes.append((off_x + rx, off_y + ry, rw, rh))
 
-        # Refine word boundaries to active ink pixels in original un-dilated line
-        word_crop = line_binary[y:y+h, x:x+w]
-        active_y, active_x = np.where(word_crop == 255)
-        if len(active_x) == 0:
-            continue
-
-        real_x = x + int(active_x.min())
-        real_y = y + int(active_y.min())
-        real_w = int(active_x.max() - active_x.min() + 1)
-        real_h = int(active_y.max() - active_y.min() + 1)
-
-        # Ignore tiny border touches
-        if real_w < adaptive_min_w or real_h < adaptive_min_h:
-            continue
-
-        # Convert to global coordinates
-        word_boxes.append((off_x + real_x, off_y + real_y, real_w, real_h))
-
-    # Sort strictly left-to-right
     word_boxes.sort(key=lambda box: box[0])
     return word_boxes
 
@@ -398,8 +458,23 @@ def merge_diacritics(
                     if overlap_y > 0 or vert_gap <= effective_vert_gap:
                         should_merge = True
 
+                # 2. Multi-stroke letter (adjacent vertical strokes like M or H sharing baseline)
+                min_h = min(merged_box[3], h2)
+                if overlap_x >= 1 and (overlap_y / max(1, min_h)) >= 0.70:
+                    should_merge = True
+
+                # 3. Small diacritic dot directly above a taller stem
+                c1_dot = (merged_box[3] <= int(word_h * 0.35) and merged_box[2] <= int(word_h * 0.40))
+                c2_dot = (h2 <= int(word_h * 0.35) and w2 <= int(word_h * 0.40))
+                if (c1_dot or c2_dot) and vert_gap <= effective_vert_gap:
+                    dot_cx = (merged_box[0] + merged_box[2] / 2.0) if c1_dot else (x2 + w2 / 2.0)
+                    stem_x = x2 if c1_dot else merged_box[0]
+                    stem_w = w2 if c1_dot else merged_box[2]
+                    if (stem_x - 10) <= dot_cx <= (stem_x + stem_w + 10):
+                        should_merge = True
+
                 # Bound combined width to reasonable character aspect ratio
-                if should_merge and combined_w <= int(max(word_h, 30) * 1.15):
+                if should_merge and combined_w <= int(max(word_h, 30) * 1.25):
                     new_x = min(merged_box[0], x2)
                     new_y = min(merged_box[1], y2)
                     merged_box = [new_x, new_y, combined_w, combined_h]
@@ -419,7 +494,8 @@ def split_wide_ligature(
     aspect_ratio_threshold: float = config.MAX_ASPECT_RATIO_SPLIT,
 ) -> List[Tuple[int, int, int, int]]:
     """
-    Detects and splits joined cursive characters (ligatures) at thinned stroke valleys.
+    Detects and splits joined cursive characters (ligatures) at thinned stroke valleys,
+    preserving multi-hump individual characters (e.g. 'm', 'w', 'M', 'W').
 
     Args:
         char_binary: 2D binary crop of the connected component.
@@ -433,7 +509,7 @@ def split_wide_ligature(
         return []
 
     aspect_ratio = float(w) / float(max(1, h))
-    if aspect_ratio <= aspect_ratio_threshold or w < 24:
+    if aspect_ratio <= aspect_ratio_threshold or w < 28:
         return [(0, 0, w, h)]
 
     # Compute column projection (VPP)
@@ -449,8 +525,8 @@ def split_wide_ligature(
     min_val = np.min(mid_vpp)
     max_val = np.max(vpp)
 
-    # If significant thinning exists (valley <= 0.6 * max stroke density)
-    if max_val > 0 and (min_val / float(max_val)) <= 0.60:
+    # If significant thinning exists (valley <= 0.45 * max stroke density)
+    if max_val > 0 and (min_val / float(max_val)) <= 0.45:
         split_x = mid_start + int(np.argmin(mid_vpp))
         # Ensure sub-boxes have reasonable widths
         if split_x >= 6 and (w - split_x) >= 6:

@@ -59,7 +59,7 @@ MIN_CHAR_AREA = 15                   # Minimum pixel area for valid character CC
 MIN_CHAR_WIDTH = 3                   # Minimum character bounding box width (pixels)
 MIN_CHAR_HEIGHT = 5                  # Minimum character bounding box height (pixels)
 MAX_CHAR_ASPECT_RATIO = 8.0          # Filter horizontal ruling lines or vertical scratches
-MAX_ASPECT_RATIO_SPLIT = 1.8         # Split wide connected components (joined characters)
+MAX_ASPECT_RATIO_SPLIT = 2.8         # Split wide connected components (prevents cutting single 'm' and 'w')
 OVERLAP_SPLIT_THRESHOLD = 1.8        # Ratio against median width to trigger ligature split
 
 # -------------------------------------------------------------------------
@@ -105,5 +105,17 @@ DRAW_BOUNDING_BOXES = True
 DRAW_CONFIDENCE_SCORES = True
 ENABLE_LEXICON_CORRECTION = True     # Statistical beam-search dictionary post-correction
 LEXICON_FILE = MODELS_DIR / "lexicon.txt"
-LEXICON_MIN_AVG_PROB = 0.05          # Minimum average letter probability for candidate acceptance
+LEXICON_MIN_AVG_PROB = 0.02          # Minimum average letter probability for candidate acceptance
+CUSTOM_VOCABULARY = [
+    "shinchan",
+    "mera",
+    "naam",
+    "hin",
+    "hai",
+    "bambhani",
+    "machine",
+    "learning",
+    "network",
+    "flow",
+]
 ANNOTATION_COLOR = (0, 255, 0)       # Green (BGR)

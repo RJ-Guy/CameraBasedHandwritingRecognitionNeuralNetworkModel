@@ -144,9 +144,18 @@ class LexiconEngine:
                         self.clean_lexicon.add(w)
                         self.lexicon_by_len.setdefault(len(w), []).append(w)
 
-            for L, words in self.lexicon_by_len.items():
-                arr = np.array([[ord(c) - ord("a") for c in w] for w in words], dtype=np.int32)
-                self.lexicon_arrays[L] = (words, arr)
+        # Incorporate domain/custom vocabulary from config
+        custom_words = getattr(config, "CUSTOM_VOCABULARY", [])
+        for w in custom_words:
+            w_clean = w.strip().lower()
+            if w_clean and all("a" <= c <= "z" for c in w_clean):
+                self.clean_lexicon.add(w_clean)
+                if w_clean not in self.lexicon_by_len.get(len(w_clean), []):
+                    self.lexicon_by_len.setdefault(len(w_clean), []).append(w_clean)
+
+        for L, words in self.lexicon_by_len.items():
+            arr = np.array([[ord(c) - ord("a") for c in w] for w in words], dtype=np.int32)
+            self.lexicon_arrays[L] = (words, arr)
 
     def _load_label_mapping(self):
         map_file = getattr(config, "LABEL_MAP_FILE", config.MODELS_DIR / "label_mapping.json")
@@ -159,7 +168,7 @@ class LexiconEngine:
     def correct_word(
         self,
         char_preds: List[Any],
-        min_avg_prob: float = getattr(config, "LEXICON_MIN_AVG_PROB", 0.05),
+        min_avg_prob: float = getattr(config, "LEXICON_MIN_AVG_PROB", 0.02),
     ) -> Tuple[str, float, str]:
         """
         Corrects an ordered list of character predictions using probability-weighted lexicon scoring.
@@ -175,17 +184,17 @@ class LexiconEngine:
         if not alpha_chars or not self.clean_lexicon:
             return raw_word, raw_conf, raw_word
 
-        upper_ratio = sum(1 for c in alpha_chars if c.isupper()) / len(alpha_chars)
+        upper_ratio = sum(1 for c in alpha_chars if c.isupper()) / max(1, len(alpha_chars))
         is_upper = (upper_ratio >= 0.60)
-        is_title = (not is_upper) and raw_word[0].isupper()
+        is_title = (not is_upper) and (raw_word[0].isupper() or raw_word[0] in "123456789")
 
         low_word = raw_word.lower()
         if low_word in self.clean_lexicon:
             formatted = raw_word.upper() if is_upper else (raw_word.capitalize() if is_title else raw_word)
             return formatted, raw_conf, raw_word
 
-        # Fast digit-letter substitution (0 -> o, 1 -> i, etc.)
-        sub_map = {"0": "o", "1": "i", "5": "s", "8": "b", "2": "z"}
+        # Fast digit-letter substitution (0 -> o, 1 -> i, 5 -> s, 8 -> b, etc.)
+        sub_map = {"0": "o", "1": "i", "5": "s", "8": "b", "2": "z", "9": "i", "7": "t", "4": "a"}
         digit_fixed = "".join(sub_map.get(c, c) for c in low_word)
         if digit_fixed in self.clean_lexicon:
             formatted = digit_fixed.upper() if is_upper else (digit_fixed.capitalize() if is_title else digit_fixed)
@@ -210,6 +219,13 @@ class LexiconEngine:
                         logp_matrix[i, ord(p_char) - ord("a")] = np.log(max(conf, 0.5))
 
             word_scores = np.sum(logp_matrix[np.arange(L), cand_indices], axis=1)
+
+            # Apply unigram domain prior boost to domain vocabulary terms
+            custom_set = set(getattr(config, "CUSTOM_VOCABULARY", []))
+            for idx_w, w in enumerate(cands):
+                if w in custom_set:
+                    word_scores[idx_w] += 7.0
+
             best_idx = int(np.argmax(word_scores))
             best_word = cands[best_idx]
             best_score = float(word_scores[best_idx])
@@ -218,6 +234,11 @@ class LexiconEngine:
             if avg_prob >= min_avg_prob:
                 formatted = best_word.upper() if is_upper else (best_word.capitalize() if is_title else best_word)
                 return formatted, avg_prob, raw_word
+
+        # Fallback: Digit-to-letter conversion for predominantly alphabetic word
+        if len(alpha_chars) / max(1, len(raw_word)) >= 0.5:
+            fixed = "".join(sub_map.get(c, c) for c in raw_word)
+            return fixed, raw_conf, raw_word
 
         return raw_word, raw_conf, raw_word
 
